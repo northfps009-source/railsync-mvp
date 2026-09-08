@@ -1,0 +1,11 @@
+id,section,duration_min,maintenance_type
+BLOCK_001,A,60,Track Inspection
+BLOCK_002,A,45,Track Inspection
+BLOCK_003,B,60,Track Inspection
+BLOCK_004,C,45,Track Inspection
+BLOCK_005,A,90,Signal Maintenance
+BLOCK_006,B,90,Signal Maintenance
+BLOCK_007,C,90,Signal Maintenance
+BLOCK_008,B,180,Bridge Check
+BLOCK_009,C,240,Bridge Check
+BLOCK_010,C,240,Cable Replacement
