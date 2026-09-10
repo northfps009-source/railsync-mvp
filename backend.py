@@ -25,6 +25,135 @@ blocks_df = pd.read_csv("blocks.csv")
 print(f"✓ Loaded {len(trains_df)} trains from CSV")
 print(f"✓ Loaded {len(blocks_df)} blocks from CSV")
 
+# ---------------------------------------------------------
+# VALIDATE RAILWAY DATA
+# ---------------------------------------------------------
+
+def validate_data():
+    # Required columns
+    required_train_columns = {
+        "id",
+        "section",
+        "departure_min",
+        "arrival_min",
+        "passengers",
+        "priority"
+    }
+
+    required_block_columns = {
+        "id",
+        "section",
+        "duration_min",
+        "maintenance_type"
+    }
+
+    missing_train_columns = required_train_columns - set(trains_df.columns)
+    missing_block_columns = required_block_columns - set(blocks_df.columns)
+
+    if missing_train_columns:
+        raise ValueError(
+            f"Invalid trains.csv: missing columns {sorted(missing_train_columns)}"
+        )
+
+    if missing_block_columns:
+        raise ValueError(
+            f"Invalid blocks.csv: missing columns {sorted(missing_block_columns)}"
+        )
+
+    # -----------------------------------------------------
+    # TRAIN VALIDATION
+    # -----------------------------------------------------
+
+    if trains_df["id"].duplicated().any():
+        raise ValueError("Invalid trains.csv: duplicate train IDs found.")
+
+    if trains_df["section"].isna().any():
+        raise ValueError("Invalid trains.csv: missing train section.")
+
+    if trains_df["departure_min"].isna().any():
+        raise ValueError("Invalid trains.csv: missing departure time.")
+
+    if trains_df["arrival_min"].isna().any():
+        raise ValueError("Invalid trains.csv: missing arrival time.")
+
+    if (trains_df["departure_min"] < 0).any():
+        raise ValueError(
+            "Invalid trains.csv: departure time cannot be negative."
+        )
+
+    if (trains_df["arrival_min"] > 1440).any():
+        raise ValueError(
+            "Invalid trains.csv: arrival time cannot exceed 1440 minutes."
+        )
+
+    if (trains_df["arrival_min"] <= trains_df["departure_min"]).any():
+        raise ValueError(
+            "Invalid trains.csv: arrival time must be after departure time."
+        )
+
+    if (trains_df["passengers"] < 0).any():
+        raise ValueError(
+            "Invalid trains.csv: passenger count cannot be negative."
+        )
+
+    allowed_priorities = {"high", "medium", "low"}
+
+    invalid_priorities = set(
+        trains_df["priority"].dropna().astype(str).str.lower()
+    ) - allowed_priorities
+
+    if invalid_priorities:
+        raise ValueError(
+            f"Invalid trains.csv: unsupported priorities {sorted(invalid_priorities)}"
+        )
+
+    # -----------------------------------------------------
+    # MAINTENANCE BLOCK VALIDATION
+    # -----------------------------------------------------
+
+    if blocks_df["id"].duplicated().any():
+        raise ValueError("Invalid blocks.csv: duplicate block IDs found.")
+
+    if blocks_df["section"].isna().any():
+        raise ValueError("Invalid blocks.csv: missing block section.")
+
+    if blocks_df["duration_min"].isna().any():
+        raise ValueError("Invalid blocks.csv: missing block duration.")
+
+    if (blocks_df["duration_min"] <= 0).any():
+        raise ValueError(
+            "Invalid blocks.csv: block duration must be greater than zero."
+        )
+
+    if (blocks_df["duration_min"] > 1440).any():
+        raise ValueError(
+            "Invalid blocks.csv: block duration cannot exceed 1440 minutes."
+        )
+
+    if blocks_df["maintenance_type"].isna().any():
+        raise ValueError(
+            "Invalid blocks.csv: missing maintenance type."
+        )
+
+    # Every block must belong to a known railway section
+    train_sections = set(
+        trains_df["section"].dropna().astype(str)
+    )
+
+    invalid_block_sections = set(
+        blocks_df["section"].dropna().astype(str)
+    ) - train_sections
+
+    if invalid_block_sections:
+        raise ValueError(
+            f"Invalid blocks.csv: unknown sections {sorted(invalid_block_sections)}"
+        )
+
+    print("✓ Railway data validation passed")
+
+
+# Run validation before starting the API
+validate_data()
 
 # ---------------------------------------------------------
 # GET ALL TRAINS
@@ -224,25 +353,44 @@ def create_schedule():
     status = solver.Solve(model)
 
     print(f"→ Solver status: {solver.StatusName(status)}")
+    
 
     # -----------------------------------------------------
-    # HANDLE SOLVER FAILURE
+    # HANDLE SOLVER STATUS
     # -----------------------------------------------------
 
-    if status not in (
-        cp_model.OPTIMAL,
-        cp_model.FEASIBLE
-    ):
+    if status == cp_model.INFEASIBLE:
         return {
             "status": "INFEASIBLE",
             "message": (
                 "No valid maintenance schedule exists "
                 "with the current train timings, sections, "
-                "durations and safety constraints."
+                "durations and 15-minute safety buffers."
             ),
             "scheduled_blocks": []
         }
 
+    if status == cp_model.UNKNOWN:
+        return {
+            "status": "UNKNOWN",
+            "message": (
+                "The solver could not determine a valid schedule "
+                "within the allowed computation time."
+            ),
+            "scheduled_blocks": []
+        }
+
+    if status == cp_model.MODEL_INVALID:
+        return {
+            "status": "MODEL_INVALID",
+            "message": (
+                "The optimization model is invalid. "
+                "Please check the railway input data and constraints."
+            ),
+            "scheduled_blocks": []
+        }
+    # Objective value is only valid for a feasible solution
+    objective_value = int(solver.ObjectiveValue())
     # -----------------------------------------------------
     # BUILD RESULT
     # -----------------------------------------------------
@@ -269,19 +417,78 @@ def create_schedule():
             )
 
         scheduled_blocks.append({
-            "id": block_id,
-            "section": section,
-            "maintenance_type": str(block["maintenance_type"]),
-            "duration_min": int(block["duration_min"]),
-            "scheduled_start_min": start_min,
-            "scheduled_end_min": end_min,
-            "reason": reason
-        })
+    "id": block_id,
+    "section": section,
+    "maintenance_type": str(block["maintenance_type"]),
+    "duration_min": int(block["duration_min"]),
+
+    "scheduled_start_min": start_min,
+    "scheduled_end_min": end_min,
+
+    "scheduled_start_time": f"{start_min // 60:02d}:{start_min % 60:02d}",
+    "scheduled_end_time": f"{end_min // 60:02d}:{end_min % 60:02d}",
+
+    "reason": reason
+})
+        # ---------------------------------------------------------
+    # BUILD SCHEDULE SUMMARY
+    # ---------------------------------------------------------
+
+    total_maintenance_minutes = sum(
+        block["duration_min"] for block in scheduled_blocks
+    )
+
+    peak_maintenance_minutes = 0
+
+    for block in scheduled_blocks:
+        start = block["scheduled_start_min"]
+        end = block["scheduled_end_min"]
+
+        peak_start = max(start, PEAK_START)
+        peak_end = min(end, PEAK_END)
+
+        if peak_end > peak_start:
+            peak_maintenance_minutes += peak_end - peak_start
+
+    off_peak_maintenance_minutes = (
+        total_maintenance_minutes - peak_maintenance_minutes
+    )
+
+    # ---------------------------------------------------------
+    # FINAL API RESPONSE
+    # ---------------------------------------------------------
 
     return {
         "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
+
+        "optimization": {
+            "objective": "Minimize peak-hour maintenance",
+            "peak_period": "06:00-22:00",
+            "safety_buffer_min": 15
+        },
+
+        "summary": {
+            "total_blocks": len(scheduled_blocks),
+            "total_maintenance_minutes": total_maintenance_minutes,
+            "peak_maintenance_minutes": peak_maintenance_minutes,
+            "off_peak_maintenance_minutes": off_peak_maintenance_minutes,
+            "optimization_objective": objective_value
+        },
+
         "scheduled_blocks": scheduled_blocks
     }
+
+# ---------------------------------------------------------
+# HEALTH CHECK
+# ---------------------------------------------------------
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "ok",
+        "service": "RailSync AI Backend"
+    }
+
 
 
 # ---------------------------------------------------------
